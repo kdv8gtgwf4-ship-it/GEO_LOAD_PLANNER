@@ -15,15 +15,14 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install PyInstaller and Pillow
-        run: python -m pip install --upgrade pyinstaller pillow
+      - name: Install libraries
+        run: python -m pip install --upgrade pyinstaller pillow xlrd openpyxl
+
+      - name: Embed company logo
+        run: python embed_logo.py
 
       - name: Build EXE
-        shell: pwsh
-        run: |
-          $extra = @()
-          if (Test-Path logo.png) { $extra = @('--add-data', 'logo.png;.') }
-          python -m PyInstaller --onefile --windowed --clean --name GeoContainerLoadingPlanner @extra geo_container_loading_planner.py
+        run: python -m PyInstaller --onefile --windowed --clean --name GeoContainerLoadingPlanner --hidden-import logo_data geo_container_loading_planner.py
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
