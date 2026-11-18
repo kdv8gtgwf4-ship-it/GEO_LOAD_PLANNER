@@ -11,8 +11,10 @@ import io
 import json
 import math
 import os
+import random
 import re
 import sys
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from dataclasses import dataclass
@@ -39,6 +41,7 @@ BLUE = "#2c6fb7"
 MUTED = "#5b6b84"
 BORDER = "#d5dbe6"
 FOOTER_TEXT = "@GEO SENSE TECHNOLOGY, PAK NAM PRAN/THAILAND"
+NO_SPACE = "not enough space left in the container"
 DEFAULT_H = 1500.0  # height assumed for Excel items that have no height, mm
 
 
@@ -48,8 +51,8 @@ DEFAULT_H = 1500.0  # height assumed for Excel items that have no height, mm
 @dataclass
 class Pallet:
     """A load: either a pallet or a winch.
-    src    = index of the Excel file it came from (0 = entered by hand) -> label "3.2"
-    origin = text describing where it came from (file / box)"""
+    src    = (kept only for old configuration files, not used any more)
+    origin = text describing where it came from (Excel file / box)"""
     number: int
     l: float
     w: float
@@ -61,88 +64,174 @@ class Pallet:
 
     @property
     def label(self):
-        return f"{self.number}.{self.src}" if self.src else str(self.number)
+        return str(self.number)
 
 
-def _split_free(free, bx, by, bz, bx1, by1, bz1, stackable):
-    new = []
-    for f in free:
-        fx, fy, fz, fl, fw, fh = f
-        fx2, fy2, fz2 = fx + fl, fy + fw, fz + fh
-        if (bx >= fx2 - EPS or bx1 <= fx + EPS or by >= fy2 - EPS or
-                by1 <= fy + EPS or bz >= fz2 - EPS or bz1 <= fz + EPS):
-            new.append(f)
-            continue
-        if bx > fx + EPS:
-            new.append((fx, fy, fz, bx - fx, fw, fh))
-        if bx1 < fx2 - EPS:
-            new.append((bx1, fy, fz, fx2 - bx1, fw, fh))
-        if by > fy + EPS:
-            new.append((fx, fy, fz, fl, by - fy, fh))
-        if by1 < fy2 - EPS:
-            new.append((fx, by1, fz, fl, fy2 - by1, fh))
-        if bz > fz + EPS:
-            new.append((fx, fy, fz, fl, fw, bz - fz))
-        if stackable and bz1 < fz2 - EPS:
-            new.append((fx, fy, bz1, fl, fw, fz2 - bz1))
-    # drop free spaces fully contained in other free spaces
+def _prune_rects(rects, min_side):
+    """Keeps only maximal free rectangles that are still big enough for the smallest load."""
+    rects = [r for r in rects if min(r[2], r[3]) >= min_side - EPS]
+    rects.sort(key=lambda r: -(r[2] * r[3]))
     keep = []
-    for i, a in enumerate(new):
-        ax2, ay2, az2 = a[0] + a[3], a[1] + a[4], a[2] + a[5]
-        inside = False
-        for j, g in enumerate(new):
-            if i == j:
-                continue
-            if (g[0] <= a[0] + EPS and g[1] <= a[1] + EPS and g[2] <= a[2] + EPS and
-                    g[0] + g[3] >= ax2 - EPS and g[1] + g[4] >= ay2 - EPS and
-                    g[2] + g[5] >= az2 - EPS):
-                same = (abs(g[0] - a[0]) < EPS and abs(g[1] - a[1]) < EPS and
-                        abs(g[2] - a[2]) < EPS and abs(g[3] - a[3]) < EPS and
-                        abs(g[4] - a[4]) < EPS and abs(g[5] - a[5]) < EPS)
-                if not same or j < i:
-                    inside = True
-                    break
-        if not inside:
-            keep.append(a)
+    for x, y, w, h in rects:
+        for kx, ky, kw, kh in keep:
+            if kx <= x + EPS and ky <= y + EPS and kx + kw >= x + w - EPS and ky + kh >= y + h - EPS:
+                break
+        else:
+            keep.append((x, y, w, h))
     return keep
 
 
-def _run_pack(Le, We, H, pallets, order_key, pos_key):
-    """Loads stand on the floor only. The GAP between loads is ensured by enlarging every
-    load and the usable floor by GAP in length and width. Le/We is the usable floor
-    (container interior minus the clearance at the walls and doors)."""
-    free = [(0.0, 0.0, 0.0, float(Le) + GAP, float(We) + GAP, float(H))]
+def _split_rects(free, bx, by, bx1, by1, min_side):
+    new = []
+    for fx, fy, fw, fh in free:
+        fx2, fy2 = fx + fw, fy + fh
+        if bx >= fx2 - EPS or bx1 <= fx + EPS or by >= fy2 - EPS or by1 <= fy + EPS:
+            new.append((fx, fy, fw, fh))
+            continue
+        if bx > fx + EPS:
+            new.append((fx, fy, bx - fx, fh))
+        if bx1 < fx2 - EPS:
+            new.append((bx1, fy, fx2 - bx1, fh))
+        if by > fy + EPS:
+            new.append((fx, fy, fw, by - fy))
+        if by1 < fy2 - EPS:
+            new.append((fx, by1, fw, fy2 - by1))
+    return _prune_rects(new, min_side)
+
+
+def _decode(Le, We, order, pref, fixed, min_side):
+    """Places the loads one by one (in the given order) at the free spot nearest to the front
+    wall. pref[n]: 0 = try both orientations, 1 = long side along the container, 2 = across.
+    Everything is in 'effective' coordinates: the floor is enlarged by GAP and each load too,
+    so that the GAP between loads is guaranteed (the clearance to walls is added afterwards)."""
+    free = [(0.0, 0.0, Le + GAP, We + GAP)]
+    for x, y, dx, dy in fixed:
+        free = _split_rects(free, x, y, x + dx + GAP, y + dy + GAP, min_side)
     placed, failed = [], []
-    for p in sorted(pallets, key=order_key):
+    for p in order:
+        a, b = max(p.l, p.w), min(p.l, p.w)
+        pr = pref.get(p.number, 0)
+        if pr == 1:
+            orients = [(a, b)]
+        elif pr == 2:
+            orients = [(b, a)]
+        else:
+            orients = [(a, b), (b, a)] if a - b > EPS else [(a, b)]
         best = None
-        orients = [(p.l, p.w)]
-        if abs(p.l - p.w) > EPS:
-            orients.append((p.w, p.l))
         for dx, dy in orients:
-            for f in free:
-                fx, fy, fz, fl, fw, fh = f
-                if dx + GAP <= fl + EPS and dy + GAP <= fw + EPS and p.h <= fh + EPS:
-                    key = pos_key(fx, fy, fz) + (fx + dx,)
+            for fx, fy, fw, fh in free:
+                if dx + GAP <= fw + EPS and dy + GAP <= fh + EPS:
+                    key = (fx, fy, fx + dx)
                     if best is None or key < best[0]:
-                        best = (key, fx, fy, fz, dx, dy)
+                        best = (key, fx, fy, dx, dy)
         if best is None:
             failed.append(p)
             continue
-        _, x, y, z, dx, dy = best
-        placed.append(dict(n=p.number, label=p.label, kind=p.kind, x=x, y=y, z=z, dx=dx, dy=dy, h=p.h,
-                           level=1, rotated=(abs(dx - p.l) > EPS), pallet=p))
-        free = _split_free(free, x, y, z, x + dx + GAP, y + dy + GAP, z + p.h, False)
+        _, x, y, dx, dy = best
+        placed.append((p, x, y, dx, dy))
+        free = _split_rects(free, x, y, x + dx + GAP, y + dy + GAP, min_side)
     return placed, failed
 
 
-def plan_loading(L, W, H, pallets):
-    """Builds the loading plan. Returns (placed, unplaced[(load, reason)])."""
-    unplaced = []
-    candidates = []
+def _objective(placed, failed, fixed_info):
+    """(loads that did not fit, 'big-load-nearer-to-the-front' penalty, used length).
+    Smaller loads should be at the front wall, the biggest ones next to the doors."""
+    items = [(p.l * p.w, x + dx / 2.0) for p, x, y, dx, dy in placed] + list(fixed_info)
+    pen = 0.0
+    for i, (ai, xi) in enumerate(items):
+        for j, (aj, xj) in enumerate(items):
+            if i != j and ai < 0.9 * aj and xi > xj + 150:
+                pen += (xi - xj - 150) / 1000.0
+    maxx = max((x + dx for p, x, y, dx, dy in placed), default=0)
+    return (len(failed), round(pen, 3), maxx)
+
+
+def _solve(loads, Le, We, fixed, fixed_info, budget, seed=1):
+    """Searches for an arrangement in which all loads fit and the smallest loads are at the
+    front wall and the largest next to the doors (swapping order / orientation, hill climbing)."""
+    if not loads:
+        return [], []
+    rnd = random.Random(seed)
+    min_side = min(min(p.l, p.w) for p in loads) + GAP
+    key_asc = lambda p: (p.l * p.w, max(p.l, p.w), p.number)
+    inits = [sorted(loads, key=key_asc), sorted(loads, key=key_asc, reverse=True),
+             sorted(loads, key=lambda p: (-max(p.l, p.w), -min(p.l, p.w))), list(loads)]
+
+    def evaluate(order, pref):
+        pl, fl = _decode(Le, We, order, pref, fixed, min_side)
+        return _objective(pl, fl, fixed_info), pl, fl
+
+    best = None
+    for o in inits:
+        ob, pl, fl = evaluate(o, {})
+        if best is None or ob < best[0]:
+            best = (ob, o, {}, pl, fl)
+    cur = best
+    t0 = time.perf_counter()
+    stall = 0
+    since_best = 0
+    n = len(loads)
+    while time.perf_counter() - t0 < budget:
+        if best[0][0] == 0 and (best[0][1] == 0.0 or since_best > 6000):
+            break
+        o, pf = list(cur[1]), dict(cur[2])
+        r = rnd.random()
+        if n > 1 and r < 0.45:
+            i, j = rnd.sample(range(n), 2)
+            o[i], o[j] = o[j], o[i]
+        elif n > 1 and r < 0.7:
+            o.insert(rnd.randrange(n), o.pop(rnd.randrange(n)))
+        else:
+            pf[rnd.choice(o).number] = rnd.choice((0, 1, 2))
+        ob, pl, fl = evaluate(o, pf)
+        if ob <= cur[0]:
+            cur = (ob, o, pf, pl, fl)
+        if ob < best[0]:
+            best = (ob, o, pf, pl, fl)
+            stall = since_best = 0
+        else:
+            stall += 1
+            since_best += 1
+        if stall > 300:  # restart from a perturbed copy of the best solution
+            o, pf = list(best[1]), dict(best[2])
+            for _ in range(4):
+                if n > 1:
+                    i, j = rnd.sample(range(n), 2)
+                    o[i], o[j] = o[j], o[i]
+            for _ in range(2):
+                pf[rnd.choice(o).number] = rnd.choice((0, 1, 2))
+            ob, pl, fl = evaluate(o, pf)
+            cur = (ob, o, pf, pl, fl)
+            stall = 0
+    return best[3], best[4]
+
+
+def boxes_conflict(a, b):
+    """True if two placed loads overlap or are closer to each other than GAP."""
+    gx = max(b["x"] - (a["x"] + a["dx"]), a["x"] - (b["x"] + b["dx"]))
+    gy = max(b["y"] - (a["y"] + a["dy"]), a["y"] - (b["y"] + b["dy"]))
+    return max(gx, gy) < GAP - EPS
+
+
+def assign_order(placed):
+    """Loading sequence: from the front wall towards the doors."""
+    placed.sort(key=lambda b: (round(b["x"], 1), round(b["y"], 1)))
+    for i, b in enumerate(placed, 1):
+        b["order"] = i
+
+
+def plan_loading(L, W, H, pallets, fixed=None, budget=1.5):
+    """Builds the loading plan. Returns (placed, unplaced[(load, reason)]).
+    fixed = {load number: (x, y, dx, dy)} - loads that must stay exactly where they are;
+    all the other loads are arranged around them."""
+    fixed = fixed or {}
+    unplaced, candidates, fixed_loads = [], [], []
     Hmax = min(H, MAX_H)  # height is limited by both the container and the 220 cm rule
     Le, We = L - 2 * GAP, W - 2 * GAP  # usable floor after clearance from walls and doors
     for p in pallets:
-        if p.h > Hmax + EPS:
+        if p.number in fixed:
+            fixed_loads.append(p)
+        elif p.h > Hmax + EPS:
             unplaced.append((p, f"height exceeds the allowed maximum ({fmt(Hmax)} mm)"))
         elif Le <= 0 or We <= 0 or not ((p.l <= Le + EPS and p.w <= We + EPS) or
                                         (p.w <= Le + EPS and p.l <= We + EPS)):
@@ -151,40 +240,22 @@ def plan_loading(L, W, H, pallets):
         else:
             candidates.append(p)
 
-    order_keys = [
-        lambda p: (-p.l * p.w, -p.h, p.number),
-        lambda p: (-p.h, -p.l * p.w, p.number),
-        lambda p: (-p.l * p.w * p.h, p.number),
-        lambda p: (-max(p.l, p.w), -p.l * p.w, p.number),
-        lambda p: (p.number,),
-    ]
-    pos_keys = [lambda x, y, z: (z, x, y),
-                lambda x, y, z: (x, y, z),
-                lambda x, y, z: (x, z, y)]
-
-    best, best_score = None, None
-    if candidates:
-        for ok_ in order_keys:
-            for pk in pos_keys:
-                placed, failed = _run_pack(Le, We, Hmax, candidates, ok_, pk)
-                vol = sum(b["dx"] * b["dy"] * b["h"] for b in placed)
-                maxx = max((b["x"] + b["dx"] for b in placed), default=0)
-                score = (len(placed), vol, -maxx)
-                if best_score is None or score > best_score:
-                    best_score, best = score, (placed, failed)
-    placed, failed = best if best else ([], [])
+    fx = [(fixed[p.number][0] - GAP, fixed[p.number][1] - GAP, fixed[p.number][2], fixed[p.number][3])
+          for p in fixed_loads]
+    info = [(p.l * p.w, fixed[p.number][0] - GAP + fixed[p.number][2] / 2.0) for p in fixed_loads]
+    placed_eff, failed = _solve(candidates, Le, We, fx, info, budget)
     for p in failed:
-        unplaced.append((p, "not enough space left in the container"))
+        unplaced.append((p, NO_SPACE))
 
-    # shift everything by the clearance so that walls and doors keep their gap
-    for b in placed:
-        b["x"] += GAP
-        b["y"] += GAP
-
-    # loading sequence: from the front wall towards the doors
-    placed.sort(key=lambda b: (round(b["x"], 1), round(b["y"], 1)))
-    for i, b in enumerate(placed, 1):
-        b["order"] = i
+    placed = []
+    for p, x, y, dx, dy in placed_eff:
+        placed.append(dict(n=p.number, label=p.label, kind=p.kind, x=x + GAP, y=y + GAP, z=0.0,
+                           dx=dx, dy=dy, h=p.h, level=1, rotated=abs(dx - p.l) > EPS, pallet=p))
+    for p in fixed_loads:
+        x, y, dx, dy = fixed[p.number]
+        placed.append(dict(n=p.number, label=p.label, kind=p.kind, x=x, y=y, z=0.0, dx=dx, dy=dy,
+                           h=p.h, level=1, rotated=abs(dx - p.l) > EPS, pallet=p))
+    assign_order(placed)
     unplaced.sort(key=lambda t: t[0].number)
     return placed, unplaced
 
@@ -427,7 +498,7 @@ def parse_packing_list(path, default_h=DEFAULT_H):
 class ImportDialog(tk.Toplevel):
     """Preview of the loads read from one or several Excel files, before they are added."""
 
-    def __init__(self, master, files, start_number, start_src, default_h):
+    def __init__(self, master, files, start_number, default_h):
         super().__init__(master)
         self.title("Import from Excel")
         self.configure(bg="white")
@@ -438,19 +509,18 @@ class ImportDialog(tk.Toplevel):
         n = start_number
         for k, fi in enumerate(files):
             for it in fi["items"]:
-                it["src"] = start_src + k
+                it["src"] = 0
                 it["number"] = n
                 n += 1
                 self.items.append(it)
 
         frm = ttk.Frame(self, padding=14)
         frm.pack(fill="both", expand=True)
-        parts = "; ".join(f"file {start_src + k}: {fi['name']} ({len(fi['items'])} loads)"
-                          for k, fi in enumerate(files))
+        parts = "; ".join(f"{fi['name']} ({len(fi['items'])} loads)" for fi in files)
         ttk.Label(frm, text=f"{len(self.items)} loads found.  {parts}", wraplength=930,
                   font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        ttk.Label(frm, text="Numbering continues across files; the number after the dot is the "
-                            "file the load came from (e.g. 6.2 = 6th load, from the 2nd file).",
+        ttk.Label(frm, text="Loads from all files are numbered one after another "
+                            "(1, 2, 3, ...). The Source column shows the file and box.",
                   foreground=MUTED, wraplength=930).pack(anchor="w", pady=(2, 8))
 
         warns = [w for fi in files for w in fi["warnings"]]
@@ -497,7 +567,7 @@ class ImportDialog(tk.Toplevel):
             self.tree.delete(i)
         for idx, it in enumerate(self.items):
             self.tree.insert("", "end", values=(
-                f"{it['number']}.{it['src']}", it["kind"], fmt(it["l"]), fmt(it["w"]),
+                str(it["number"]), it["kind"], fmt(it["l"]), fmt(it["w"]),
                 fmt(it["h"]) + ("*" if it["assumed_h"] else ""), it["origin"]),
                 tags=("odd",) if idx % 2 else ())
 
@@ -523,12 +593,49 @@ class ImportDialog(tk.Toplevel):
 #  Loading diagram (top view) - on screen
 # ----------------------------------------------------------------------------
 class PlanCanvas(tk.Canvas):
-    def __init__(self, master, L, W, placed):
+    """Top view of the container. Loads can be selected and dragged with the mouse.
+    Internal coordinates: X from the front wall (doors at X = L), Y from the left wall.
+    door_left=True turns the picture by 180 degrees (doors on the left side)."""
+
+    def __init__(self, master, L, W, placed, door_left=False, on_select=None, on_drop=None):
         super().__init__(master, bg="white", highlightthickness=0)
         self.L, self.W, self.placed = L, W, placed
-        self._fonts = {}
+        self.door_left, self.on_select, self.on_drop = door_left, on_select, on_drop
+        self.pinned, self.selected = set(), None
+        self._fonts, self._rects, self._drag = {}, {}, None
+        self.s = self.ox = self.top = self.bottom = None
         self.bind("<Configure>", lambda e: self.redraw())
+        self.bind("<ButtonPress-1>", self._press)
+        self.bind("<B1-Motion>", self._motion)
+        self.bind("<ButtonRelease-1>", self._release)
 
+    def set_data(self, placed, pinned=None, selected=None, door_left=None):
+        self.placed = placed
+        if pinned is not None:
+            self.pinned = pinned
+        self.selected = selected
+        if door_left is not None:
+            self.door_left = door_left
+        self.redraw()
+
+    # ---- coordinates -------------------------------------------------------
+    def rect_of(self, b):
+        s, ox, top, bottom = self.s, self.ox, self.top, self.bottom
+        if self.door_left:
+            x1 = ox + (self.L - b["x"] - b["dx"]) * s
+            y1 = top + b["y"] * s
+        else:
+            x1 = ox + b["x"] * s
+            y1 = bottom - (b["y"] + b["dy"]) * s
+        return x1, y1, x1 + b["dx"] * s, y1 + b["dy"] * s
+
+    def internal_xy(self, x1, y1, dx, dy):
+        s = self.s
+        if self.door_left:
+            return self.L - dx - (x1 - self.ox) / s, (y1 - self.top) / s
+        return (x1 - self.ox) / s, (self.bottom - y1 - dy * s) / s
+
+    # ---- drawing -----------------------------------------------------------
     def _font(self, px, bold=False):
         from tkinter import font as tkfont
         key = (px, bold)
@@ -537,7 +644,7 @@ class PlanCanvas(tk.Canvas):
                                            weight="bold" if bold else "normal")
         return self._fonts[key]
 
-    def _write_label(self, b, x1, y1, x2, y2):
+    def _write_label(self, b, x1, y1, x2, y2, tag):
         """Writes #label, type and size inside the rectangle, using the biggest font that fits."""
         rw, rh = x2 - x1, y2 - y1
         texts = (f"#{b['label']}", b["kind"], f"{fmt(b['dx'])}×{fmt(b['dy'])}×{fmt(b['h'])}")
@@ -550,41 +657,96 @@ class PlanCanvas(tk.Canvas):
                 if wmax <= rw * 0.94 and sum(lhs) <= rh * 0.94:
                     yy = (y1 + y2) / 2 - sum(lhs) / 2
                     for f, t, lh in zip(fonts, texts, lhs):
-                        self.create_text((x1 + x2) / 2, yy + lh / 2, text=t, font=f)
+                        self.create_text((x1 + x2) / 2, yy + lh / 2, text=t, font=f, tags=(tag,))
                         yy += lh
                     return
 
     def redraw(self):
         self.delete("all")
+        self._rects = {}
         cw, ch = self.winfo_width(), self.winfo_height()
         if cw < 120 or ch < 100:
             return
         s = min((cw - 130) / self.L, (ch - 100) / self.W)
-        ox = (cw - self.L * s) / 2 - 15
+        ox = (cw - self.L * s) / 2
         top = (ch - self.W * s) / 2
         bottom = top + self.W * s
         right = ox + self.L * s
+        self.s, self.ox, self.top, self.bottom = s, ox, top, bottom
 
         self.create_rectangle(ox, top, right, bottom, fill="#f3f3f3", outline="#333", width=2)
-        self.create_line(right, top, right, bottom, fill="#b00020", width=5)
-        self.create_text(right + 14, (top + bottom) / 2, text="DOORS", angle=270,
-                         fill="#b00020", font=("Segoe UI", 10, "bold"), anchor="center")
+        door_x = ox if self.door_left else right
+        self.create_line(door_x, top, door_x, bottom, fill="#b00020", width=5)
+        self.create_text(door_x - 14 if self.door_left else door_x + 14, (top + bottom) / 2,
+                         text="DOORS", angle=270, fill="#b00020", font=("Segoe UI", 10, "bold"))
+        top_wall, bot_wall = ("Left", "Right") if self.door_left else ("Right", "Left")
         self.create_text((ox + right) / 2, top - 14,
-                         text=f"Right wall  |  length {fmt(self.L)} mm",
+                         text=f"{top_wall} wall  |  length {fmt(self.L)} mm",
                          fill=MUTED, font=("Segoe UI", 9))
         self.create_text((ox + right) / 2, bottom + 14,
-                         text=f"Left wall  |  width {fmt(self.W)} mm  "
-                              f"(view from the doors, Y is measured from the left wall)",
+                         text=f"{bot_wall} wall  |  width {fmt(self.W)} mm  "
+                              f"(view from above, looking from the doors)",
                          fill=MUTED, font=("Segoe UI", 9))
 
         for b in self.placed:
-            x1 = ox + b["x"] * s
-            x2 = ox + (b["x"] + b["dx"]) * s
-            y2 = bottom - b["y"] * s
-            y1 = bottom - (b["y"] + b["dy"]) * s
+            x1, y1, x2, y2 = self.rect_of(b)
+            tag = f"L{b['n']}"
             color = PALETTE[(b["n"] - 1) % len(PALETTE)]
-            self.create_rectangle(x1, y1, x2, y2, fill=color, outline="#222", width=1.5)
-            self._write_label(b, x1, y1, x2, y2)
+            sel = (b["n"] == self.selected)
+            rid = self.create_rectangle(x1, y1, x2, y2, fill=color, tags=(tag,),
+                                        outline="#1e90ff" if sel else "#222",
+                                        width=4 if sel else 1.5)
+            self._rects[b["n"]] = rid
+            self._write_label(b, x1, y1, x2, y2, tag)
+            if b["n"] in self.pinned:  # small navy dot = this load is pinned
+                self.create_oval(x2 - 14, y1 + 4, x2 - 4, y1 + 14, fill=NAVY, outline="white",
+                                 width=1.5, tags=(tag,))
+        if self.selected in self._rects:
+            self.tag_raise(f"L{self.selected}")
+
+    # ---- mouse -------------------------------------------------------------
+    def _hit(self, x, y):
+        for b in reversed(self.placed):
+            x1, y1, x2, y2 = self.rect_of(b)
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                return b
+        return None
+
+    def _press(self, e):
+        if self.s is None:
+            return
+        b = self._hit(e.x, e.y)
+        self.selected = b["n"] if b else None
+        self._drag = (dict(n=b["n"], last=(e.x, e.y), start=(e.x, e.y), moved=False)
+                      if b else None)
+        if self.on_select:
+            self.on_select(self.selected)
+        self.redraw()  # shows the selection frame
+
+    def _motion(self, e):
+        d = self._drag
+        if not d:
+            return
+        if not d["moved"] and abs(e.x - d["start"][0]) + abs(e.y - d["start"][1]) < 4:
+            return
+        d["moved"] = True
+        self.move(f"L{d['n']}", e.x - d["last"][0], e.y - d["last"][1])
+        d["last"] = (e.x, e.y)
+        self.config(cursor="fleur")
+
+    def _release(self, e):
+        d, self._drag = self._drag, None
+        self.config(cursor="")
+        if not d or not d["moved"]:
+            return
+        b = next((q for q in self.placed if q["n"] == d["n"]), None)
+        if b is None:
+            return
+        x1, y1, _, _ = self.coords(self._rects[d["n"]])
+        x, y = self.internal_xy(x1, y1, b["dx"], b["dy"])
+        if self.on_drop:
+            self.on_drop(d["n"], x, y)
+        self.redraw()
 
 
 # ----------------------------------------------------------------------------
@@ -626,7 +788,7 @@ def _fit_text_in_box(d, rw, rh, label, kind, dims):
     return 10, 1
 
 
-def render_plan_image(cname, dims, placed, unplaced, total):
+def render_plan_image(cname, dims, placed, unplaced, total, door_left=False):
     """Draws the loading plan as a large PIL image (about 4000 px wide): header, summary,
     top view with #label / type / size on every load, and footer."""
     import textwrap
@@ -638,7 +800,7 @@ def render_plan_image(cname, dims, placed, unplaced, total):
     def P(v):
         return int(round(v * u))
 
-    ml, mr = P(120), P(210)
+    ml, mr = P(210), P(210)
     s = (IW - ml - mr) / L
     ch = W * s
 
@@ -646,7 +808,8 @@ def render_plan_image(cname, dims, placed, unplaced, total):
     used_len = max((b["x"] + b["dx"] for b in placed), default=0)
     lines = [
         (f"Container interior: {fmt(L)} × {fmt(W)} × {fmt(H)} mm    |    "
-         f"Max. load height: {fmt(min(H, MAX_H))} mm    |    Clearance: {fmt(GAP)} mm", MUTED),
+         f"Max. load height: {fmt(min(H, MAX_H))} mm    |    Clearance: {fmt(GAP)} mm    |    "
+         f"Doors: {'left' if door_left else 'right'}", MUTED),
         (f"Loads placed: {len(placed)} of {total}    |    Volume utilisation: "
          f"{vol_used / (L * W * H) * 100:.1f}%    |    Length used: {fmt(used_len)} mm, "
          f"free towards the doors: {fmt(L - used_len)} mm", NAVY),
@@ -686,24 +849,31 @@ def render_plan_image(cname, dims, placed, unplaced, total):
     ox = ml
     right = ox + L * s
     d.rectangle([ox, top, right, bottom], fill="#f3f3f3", outline="#333333", width=P(5))
-    d.line([right, top, right, bottom], fill="#b00020", width=P(14))
+    door_x = ox if door_left else right
+    d.line([door_x, top, door_x, bottom], fill="#b00020", width=P(14))
     f_door = _pil_font(P(36), True)
     bb = d.textbbox((0, 0), "DOORS", font=f_door)
     tmp = Image.new("RGBA", (bb[2] - bb[0] + 12, bb[3] - bb[1] + 12), (255, 255, 255, 0))
     ImageDraw.Draw(tmp).text((6 - bb[0], 6 - bb[1]), "DOORS", font=f_door, fill="#b00020")
     rot = tmp.rotate(270, expand=True)
-    img.paste(rot, (int(right + P(30)), int((top + bottom) / 2 - rot.height / 2)), rot)
-    _text_center(d, (ox + right) / 2, top - P(30), f"Right wall   |   length {fmt(L)} mm",
+    rx = int(door_x - P(30) - rot.width) if door_left else int(door_x + P(30))
+    img.paste(rot, (rx, int((top + bottom) / 2 - rot.height / 2)), rot)
+    top_wall, bot_wall = ("Left", "Right") if door_left else ("Right", "Left")
+    _text_center(d, (ox + right) / 2, top - P(30), f"{top_wall} wall   |   length {fmt(L)} mm",
                  _pil_font(P(30)), MUTED)
     _text_center(d, (ox + right) / 2, bottom + P(34),
-                 f"Left wall   |   width {fmt(W)} mm   (view from the doors)", _pil_font(P(30)), MUTED)
+                 f"{bot_wall} wall   |   width {fmt(W)} mm   (view from above, looking from the doors)",
+                 _pil_font(P(30)), MUTED)
 
     # loads: every one gets #label, type and size (font is chosen to fit the rectangle)
     for b in placed:
-        x1 = ox + b["x"] * s
-        x2 = ox + (b["x"] + b["dx"]) * s
-        y2 = bottom - b["y"] * s
-        y1 = bottom - (b["y"] + b["dy"]) * s
+        if door_left:  # picture turned by 180 degrees
+            x1 = ox + (L - b["x"] - b["dx"]) * s
+            y1 = top + b["y"] * s
+        else:
+            x1 = ox + b["x"] * s
+            y1 = bottom - (b["y"] + b["dy"]) * s
+        x2, y2 = x1 + b["dx"] * s, y1 + b["dy"] * s
         color = PALETTE[(b["n"] - 1) % len(PALETTE)]
         d.rectangle([x1, y1, x2, y2], fill=color, outline="#222222", width=P(3))
         rw, rh = x2 - x1, y2 - y1
@@ -727,42 +897,41 @@ def render_plan_image(cname, dims, placed, unplaced, total):
 
 
 # ----------------------------------------------------------------------------
-#  Result window
+#  Result window: diagram + editing of the arrangement
 # ----------------------------------------------------------------------------
 class ResultWindow(tk.Toplevel):
     COLS = [("order", "Loading order", 110), ("n", "#", 60), ("kind", "Type", 90),
             ("size", "Size L×W×H, mm", 150), ("x", "X, mm", 80), ("y", "Y, mm", 80),
             ("rot", "Orientation", 150)]
 
-    def __init__(self, master, cname, dims, placed, unplaced, total):
+    def __init__(self, master, cname, dims, loads, placed, unplaced):
         super().__init__(master)
         L, W, H = dims
-        self.placed, self.unplaced, self.cname = placed, unplaced, cname
-        self.dims, self.total = dims, total
+        self.cname, self.dims, self.loads = cname, dims, loads
+        self.total = len(loads)
+        self.placed, self.unplaced = placed, unplaced
+        self.pinned, self.history, self.sel = set(), [], None
+        self._lock = False
+        self.door = tk.StringVar(value="right")
+        self.auto = tk.BooleanVar(value=True)
         self.title(f"Loading Plan - {cname}")
         self.configure(bg="white")
-        self.geometry("1200x820")
+        self.geometry("1420x900")
+        self.minsize(1100, 700)
         build_header(self, "Loading Plan")
 
-        vol_used = sum(b["dx"] * b["dy"] * b["h"] for b in placed)
-        used_len = max((b["x"] + b["dx"] for b in placed), default=0)
-        txt = (f"{cname}: {fmt(L)} × {fmt(W)} × {fmt(H)} mm.   "
-               f"Loads placed: {len(placed)} of {total}.   "
-               f"Max. load height: {fmt(min(H, MAX_H))} mm.   "
-               f"Volume utilisation: {vol_used / (L * W * H) * 100:.1f}%.   "
-               f"Length used: {fmt(used_len)} mm, free towards the doors: {fmt(L - used_len)} mm.")
-        ttk.Label(self, text=txt, wraplength=1000, padding=(10, 8),
-                  font=("Segoe UI", 10, "bold")).pack(fill="x")
-        if unplaced:
-            lines = "\n".join(group_unplaced(unplaced))
-            tk.Label(self, text="DID NOT FIT:\n" + lines, fg="#b00020", bg="white",
-                     wraplength=1000, justify="left", font=("Segoe UI", 10, "bold"), padx=10
-                     ).pack(fill="x", anchor="w")
+        self.summary = ttk.Label(self, text="", wraplength=1360, padding=(10, 8),
+                                 font=("Segoe UI", 10, "bold"))
+        self.summary.pack(fill="x")
+        self.warn = tk.Label(self, text="", fg="#b00020", bg="white", wraplength=1360,
+                             justify="left", font=("Segoe UI", 10, "bold"), padx=10)
+        self.warn.pack(fill="x", anchor="w")
 
         bot = ttk.Frame(self, padding=(10, 0, 10, 10))
         bot.pack(side="bottom", fill="x")
         ttk.Label(bot, text=f"Clearance of {fmt(GAP)} mm is kept between loads and to the walls "
-                            f"and doors.", foreground=MUTED).pack(side="left")
+                            f"and doors.   Drag a load in the picture to move it - the other loads "
+                            f"are re-arranged around it.", foreground=MUTED).pack(side="left")
         ttk.Button(bot, text="Close", command=self.destroy).pack(side="right")
         ttk.Button(bot, text="Save as CSV…", command=self.save_csv).pack(side="right", padx=6)
         ttk.Button(bot, text="Save as PDF", style="Accent.TButton",
@@ -770,8 +939,369 @@ class ResultWindow(tk.Toplevel):
         ttk.Button(bot, text="Save as PNG", style="Accent.TButton",
                    command=lambda: self.export("png")).pack(side="right")
 
-        PlanCanvas(self, L, W, placed).pack(fill="both", expand=True, padx=8, pady=8)
+        pw = ttk.PanedWindow(self, orient="horizontal")
+        pw.pack(fill="both", expand=True, padx=8, pady=8)
+        left = ttk.Frame(pw)
+        right = ttk.Frame(pw, padding=(8, 0, 0, 0))
+        pw.add(left, weight=4)
+        pw.add(right, weight=1)
+        self.canvas = PlanCanvas(left, L, W, self.placed, False, self.on_canvas_select, self.on_drop)
+        self.canvas.configure(width=900, height=520)
+        self.canvas.pack(fill="both", expand=True)
+        self.build_panel(right)
+        self.refresh_all()
 
+    # ---------- right-hand panel ----------
+    def build_panel(self, p):
+        box = ttk.LabelFrame(p, text="Doors", padding=8)
+        box.pack(fill="x")
+        ttk.Radiobutton(box, text="Doors on the right", value="right", variable=self.door,
+                        command=self.on_door).pack(side="left")
+        ttk.Radiobutton(box, text="Doors on the left", value="left", variable=self.door,
+                        command=self.on_door).pack(side="left", padx=14)
+
+        lf = ttk.LabelFrame(p, text="Loads  (click a row or a load in the picture)", padding=8)
+        lf.pack(fill="both", expand=True, pady=8)
+        cols = ("n", "kind", "size", "x", "y", "order", "pin")
+        self.tree = ttk.Treeview(lf, columns=cols, show="headings", selectmode="browse", height=10)
+        for c, t, w in (("n", "#", 38), ("kind", "Type", 56), ("size", "Size, mm", 100),
+                        ("x", "X", 52), ("y", "Y", 52), ("order", "Seq.", 40), ("pin", "Pin", 36)):
+            self.tree.heading(c, text=t)
+            self.tree.column(c, width=w, anchor="center", stretch=(c == "size"))
+        self.tree.tag_configure("unplaced", foreground="#b00020")
+        sb = ttk.Scrollbar(lf, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
+
+        sf = ttk.LabelFrame(p, text="Selected load", padding=8)
+        sf.pack(fill="x")
+        self.sel_lbl = ttk.Label(sf, text="none selected", font=("Segoe UI", 10, "bold"),
+                                 wraplength=330)
+        self.sel_lbl.pack(anchor="w")
+        r1 = ttk.Frame(sf)
+        r1.pack(fill="x", pady=(6, 0))
+        ttk.Button(r1, text="Rotate 90°", command=self.rotate_selected).pack(side="left")
+        ttk.Button(r1, text="Pin / Unpin", command=self.toggle_pin).pack(side="left", padx=6)
+        ttk.Label(sf, text="Slide as far as possible:", foreground=MUTED).pack(anchor="w", pady=(8, 2))
+        g = ttk.Frame(sf)
+        g.pack(fill="x")
+        for i, (txt, d) in enumerate((("To front wall", "front"), ("To doors", "door"),
+                                      ("To left wall", "left"), ("To right wall", "right"))):
+            ttk.Button(g, text=txt, command=lambda d=d: self.slide(d)).grid(
+                row=i // 2, column=i % 2, sticky="ew", padx=2, pady=2)
+        g.columnconfigure((0, 1), weight=1)
+        r3 = ttk.Frame(sf)
+        r3.pack(fill="x", pady=(8, 0))
+        self.xv, self.yv = tk.StringVar(), tk.StringVar()
+        ttk.Label(r3, text="X:").pack(side="left")
+        ttk.Entry(r3, textvariable=self.xv, width=7).pack(side="left", padx=(2, 8))
+        ttk.Label(r3, text="Y:").pack(side="left")
+        ttk.Entry(r3, textvariable=self.yv, width=7).pack(side="left", padx=(2, 8))
+        ttk.Button(r3, text="Apply", command=self.apply_xy).pack(side="left")
+        ttk.Label(sf, text="X from the front wall, Y from the left wall (mm, corner of the load).",
+                  foreground=MUTED, wraplength=330).pack(anchor="w", pady=(4, 0))
+
+        af = ttk.LabelFrame(p, text="Arrangement", padding=8)
+        af.pack(fill="x", pady=(8, 0))
+        ttk.Checkbutton(af, text="Re-arrange the other loads automatically\n"
+                                "when a moved load is in their way",
+                        variable=self.auto).pack(anchor="w")
+        r4 = ttk.Frame(af)
+        r4.pack(fill="x", pady=(6, 0))
+        ttk.Button(r4, text="Re-arrange others", command=self.rearrange).pack(side="left")
+        ttk.Button(r4, text="Unpin all", command=self.unpin_all).pack(side="left", padx=6)
+        r5 = ttk.Frame(af)
+        r5.pack(fill="x", pady=(6, 0))
+        ttk.Button(r5, text="Undo", command=self.undo).pack(side="left")
+        ttk.Button(r5, text="Start over (auto layout)", command=self.start_over).pack(side="left", padx=6)
+
+    # ---------- state helpers ----------
+    def get_placed(self, n):
+        return next((b for b in self.placed if b["n"] == n), None)
+
+    def inside(self, b):
+        L, W, _ = self.dims
+        return (b["x"] >= GAP - EPS and b["y"] >= GAP - EPS and
+                b["x"] + b["dx"] <= L - GAP + EPS and b["y"] + b["dy"] <= W - GAP + EPS)
+
+    def snapshot(self):
+        self.history.append(([dict(b) for b in self.placed], list(self.unplaced), set(self.pinned)))
+        del self.history[:-40]
+
+    def undo(self):
+        if not self.history:
+            messagebox.showinfo(APP_TITLE, "Nothing to undo.", parent=self)
+            return
+        self.placed, self.unplaced, self.pinned = self.history.pop()
+        self.refresh_all()
+
+    def refresh_all(self):
+        assign_order(self.placed)
+        self.update_summary()
+        self.fill_tree()
+        self.canvas.set_data(self.placed, self.pinned, self.sel, self.door.get() == "left")
+        self.update_selection_panel()
+
+    def update_summary(self):
+        L, W, H = self.dims
+        vol = sum(b["dx"] * b["dy"] * b["h"] for b in self.placed)
+        used = max((b["x"] + b["dx"] for b in self.placed), default=0)
+        self.summary.config(text=(
+            f"{self.cname}: {fmt(L)} × {fmt(W)} × {fmt(H)} mm.   "
+            f"Loads placed: {len(self.placed)} of {self.total}.   "
+            f"Max. load height: {fmt(min(H, MAX_H))} mm.   "
+            f"Volume utilisation: {vol / (L * W * H) * 100:.1f}%.   "
+            f"Length used: {fmt(used)} mm, free towards the doors: {fmt(L - used)} mm.   "
+            f"Doors: {self.door.get()}."))
+        self.warn.config(text=("DID NOT FIT:\n" + "\n".join(group_unplaced(self.unplaced)))
+                         if self.unplaced else "")
+
+    def fill_tree(self):
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        rows = [(b["n"], (b["label"], b["kind"], f"{fmt(b['dx'])}×{fmt(b['dy'])}", fmt(b["x"]),
+                          fmt(b["y"]), b["order"], "●" if b["n"] in self.pinned else ""), ())
+                for b in self.placed]
+        rows += [(p.number, (p.label, p.kind, f"{fmt(p.l)}×{fmt(p.w)}", "-", "-", "-", ""),
+                  ("unplaced",)) for p, _ in self.unplaced]
+        for n, vals, tags in sorted(rows, key=lambda r: r[0]):
+            self.tree.insert("", "end", iid=str(n), values=vals, tags=tags)
+        if self.sel is not None and self.tree.exists(str(self.sel)):
+            self._lock = True
+            self.tree.selection_set(str(self.sel))
+            self._lock = False
+
+    def update_selection_panel(self):
+        b = self.get_placed(self.sel) if self.sel is not None else None
+        if b:
+            self.sel_lbl.config(text=f"#{b['label']}  {b['kind']}  {fmt(b['dx'])} × {fmt(b['dy'])} × "
+                                     f"{fmt(b['h'])} mm" + ("   (pinned)" if b["n"] in self.pinned else ""))
+            self.xv.set(fmt(b["x"]))
+            self.yv.set(fmt(b["y"]))
+        elif self.sel is not None:
+            self.sel_lbl.config(text=f"#{self.sel}: does not fit - use 'Re-arrange others' or Undo")
+            self.xv.set("")
+            self.yv.set("")
+        else:
+            self.sel_lbl.config(text="none selected")
+            self.xv.set("")
+            self.yv.set("")
+
+    # ---------- selection ----------
+    def on_tree_select(self, event=None):
+        if self._lock:
+            return
+        sel = self.tree.selection()
+        self.sel = int(sel[0]) if sel else None
+        self.canvas.set_data(self.placed, self.pinned, self.sel)
+        self.update_selection_panel()
+
+    def on_canvas_select(self, n):
+        self.sel = n
+        self._lock = True
+        if n is not None and self.tree.exists(str(n)):
+            self.tree.selection_set(str(n))
+            self.tree.see(str(n))
+        else:
+            self.tree.selection_set(())
+        self._lock = False
+        self.update_selection_panel()
+        self.canvas.selected = n
+
+    def on_door(self):
+        self.update_summary()
+        self.canvas.set_data(self.placed, self.pinned, self.sel, self.door.get() == "left")
+
+    def need_selected(self):
+        b = self.get_placed(self.sel) if self.sel is not None else None
+        if b is None:
+            messagebox.showinfo(APP_TITLE, "Select a placed load first (click it in the list "
+                                           "or in the picture).", parent=self)
+        return b
+
+    # ---------- moving things ----------
+    def place_manually(self, nb):
+        """Applies a new position / orientation for one load (and pins it)."""
+        n = nb["n"]
+        others = [o for o in self.placed if o["n"] != n]
+        pinned_conf = [o for o in others if o["n"] in self.pinned and boxes_conflict(nb, o)]
+        if pinned_conf:
+            messagebox.showinfo(APP_TITLE, f"That position is too close to the pinned load "
+                                           f"#{pinned_conf[0]['label']} (clearance {fmt(GAP)} mm is "
+                                           f"required). Unpin it first or choose another place.",
+                                parent=self)
+            self.refresh_all()
+            return False
+        conf = [o for o in others if boxes_conflict(nb, o)]
+        if conf and not self.auto.get():
+            messagebox.showinfo(APP_TITLE, f"That position is too close to load #{conf[0]['label']}. "
+                                           "Switch on 'Re-arrange the other loads automatically' "
+                                           "or move that load first.", parent=self)
+            self.refresh_all()
+            return False
+        self.snapshot()
+        b = self.get_placed(n)
+        b.update(x=nb["x"], y=nb["y"], dx=nb["dx"], dy=nb["dy"], rotated=nb["rotated"])
+        self.pinned.add(n)
+        if conf:
+            self.repack({o["n"] for o in conf})
+        self.refresh_all()
+        return True
+
+    def repack(self, conflicting=None):
+        """Arranges the loads that are not pinned again. If `conflicting` is given, first only
+        those loads (and the unplaced ones) are moved and everything else stays where it is."""
+        L, W, H = self.dims
+        self.config(cursor="watch")
+        self.update_idletasks()
+
+        def attempt(movable):
+            fixed = {b["n"]: (b["x"], b["y"], b["dx"], b["dy"])
+                     for b in self.placed if b["n"] not in movable}
+            return plan_loading(L, W, H, self.loads, fixed=fixed, budget=1.0)
+
+        def all_fit(res):
+            return not any(r == NO_SPACE for _, r in res[1])
+
+        result = None
+        if conflicting:
+            res = attempt(set(conflicting))
+            if all_fit(res):
+                result = res
+        if result is None:
+            result = attempt({b["n"] for b in self.placed if b["n"] not in self.pinned})
+        self.config(cursor="")
+        self.placed, self.unplaced = result
+        if not all_fit(result):
+            self.after(50, lambda: messagebox.showwarning(
+                APP_TITLE, "Not all loads fit around the pinned loads. The loads that do not fit "
+                           "are listed in red. Use Undo, or unpin some loads and try again.",
+                parent=self))
+
+    def rotate_selected(self):
+        b = self.need_selected()
+        if not b:
+            return
+        L, W, _ = self.dims
+        nb = dict(b, dx=b["dy"], dy=b["dx"], rotated=not b["rotated"])
+        nb["x"] = min(max(b["x"], GAP), L - GAP - nb["dx"])
+        nb["y"] = min(max(b["y"], GAP), W - GAP - nb["dy"])
+        if not self.inside(nb):
+            messagebox.showinfo(APP_TITLE, "This load cannot be rotated: it would not fit "
+                                           "inside the container.", parent=self)
+            return
+        self.place_manually(nb)
+
+    def toggle_pin(self):
+        b = self.need_selected()
+        if not b:
+            return
+        self.snapshot()
+        self.pinned.symmetric_difference_update({b["n"]})
+        self.refresh_all()
+
+    def slide(self, direction):
+        b = self.need_selected()
+        if not b:
+            return
+        L, W, _ = self.dims
+        others = [o for o in self.placed if o["n"] != b["n"]]
+        nb = dict(b)
+        if direction in ("front", "door"):
+            lim = GAP if direction == "front" else L - GAP - b["dx"]
+            for o in others:
+                if max(o["y"] - (b["y"] + b["dy"]), b["y"] - (o["y"] + o["dy"])) >= GAP - EPS:
+                    continue  # not side by side with this load
+                if direction == "front" and o["x"] + o["dx"] <= b["x"] + EPS:
+                    lim = max(lim, o["x"] + o["dx"] + GAP)
+                if direction == "door" and o["x"] >= b["x"] + b["dx"] - EPS:
+                    lim = min(lim, o["x"] - GAP - b["dx"])
+            nb["x"] = lim
+        else:
+            lim = GAP if direction == "left" else W - GAP - b["dy"]
+            for o in others:
+                if max(o["x"] - (b["x"] + b["dx"]), b["x"] - (o["x"] + o["dx"])) >= GAP - EPS:
+                    continue
+                if direction == "left" and o["y"] + o["dy"] <= b["y"] + EPS:
+                    lim = max(lim, o["y"] + o["dy"] + GAP)
+                if direction == "right" and o["y"] >= b["y"] + b["dy"] - EPS:
+                    lim = min(lim, o["y"] - GAP - b["dy"])
+            nb["y"] = lim
+        if abs(nb["x"] - b["x"]) < 0.5 and abs(nb["y"] - b["y"]) < 0.5:
+            messagebox.showinfo(APP_TITLE, "This load is already as far as it can go in that "
+                                           "direction.", parent=self)
+            return
+        self.place_manually(nb)
+
+    def apply_xy(self):
+        b = self.need_selected()
+        if not b:
+            return
+        try:
+            x = parse_pos(self.xv.get(), "X")
+            y = parse_pos(self.yv.get(), "Y")
+        except ValueError as e:
+            messagebox.showerror(APP_TITLE, str(e), parent=self)
+            return
+        nb = dict(b, x=x, y=y)
+        if not self.inside(nb):
+            messagebox.showinfo(APP_TITLE, f"Outside the container: loads must stay {fmt(GAP)} mm "
+                                           "away from the walls and doors.", parent=self)
+            return
+        self.place_manually(nb)
+
+    def snap(self, b, x, y, thr=60):
+        """Clamps the dropped position to the container and snaps it to walls / neighbours."""
+        L, W, _ = self.dims
+        dx, dy = b["dx"], b["dy"]
+        cx, cy = [GAP, L - GAP - dx], [GAP, W - GAP - dy]
+        for o in self.placed:
+            if o["n"] == b["n"]:
+                continue
+            cx += [o["x"] + o["dx"] + GAP, o["x"] - GAP - dx, o["x"], o["x"] + o["dx"] - dx]
+            cy += [o["y"] + o["dy"] + GAP, o["y"] - GAP - dy, o["y"], o["y"] + o["dy"] - dy]
+        x = min(max(x, GAP), L - GAP - dx)
+        y = min(max(y, GAP), W - GAP - dy)
+        bx = min(cx, key=lambda v: abs(v - x))
+        by = min(cy, key=lambda v: abs(v - y))
+        if abs(bx - x) <= thr:
+            x = bx
+        if abs(by - y) <= thr:
+            y = by
+        return (round(min(max(x, GAP), L - GAP - dx), 1), round(min(max(y, GAP), W - GAP - dy), 1))
+
+    def on_drop(self, n, x, y):
+        b = self.get_placed(n)
+        if b is None:
+            return
+        x, y = self.snap(b, x, y)
+        if abs(x - b["x"]) < 0.5 and abs(y - b["y"]) < 0.5:
+            return
+        self.place_manually(dict(b, x=x, y=y))
+
+    def rearrange(self):
+        self.snapshot()
+        self.repack()
+        self.refresh_all()
+
+    def unpin_all(self):
+        self.snapshot()
+        self.pinned.clear()
+        self.refresh_all()
+
+    def start_over(self):
+        self.snapshot()
+        self.pinned.clear()
+        L, W, H = self.dims
+        self.config(cursor="watch")
+        self.update_idletasks()
+        self.placed, self.unplaced = plan_loading(L, W, H, self.loads, budget=1.5)
+        self.config(cursor="")
+        self.refresh_all()
+
+    # ---------- export ----------
     def rows(self):
         out = []
         for b in sorted(self.placed, key=lambda b: b["order"]):
@@ -783,7 +1313,8 @@ class ResultWindow(tk.Toplevel):
 
     def export(self, kind):
         try:
-            img = render_plan_image(self.cname, self.dims, self.placed, self.unplaced, self.total)
+            img = render_plan_image(self.cname, self.dims, self.placed, self.unplaced, self.total,
+                                    door_left=(self.door.get() == "left"))
         except ImportError:
             messagebox.showerror(APP_TITLE, "Image export needs the Pillow library.\n"
                                             "Install it with:  pip install pillow", parent=self)
@@ -1403,8 +1934,7 @@ class App(tk.Tk):
                 return
             if ans:
                 self.pallets = []
-        start_src = max((p.src for p in self.pallets), default=0) + 1
-        dlg = ImportDialog(self, files, len(self.pallets) + 1, start_src, DEFAULT_H)
+        dlg = ImportDialog(self, files, len(self.pallets) + 1, DEFAULT_H)
         if dlg.result:
             for it in dlg.result:
                 self.pallets.append(Pallet(len(self.pallets) + 1, it["l"], it["w"], it["h"],
@@ -1424,10 +1954,9 @@ class App(tk.Tk):
             return
         self.config(cursor="watch")
         self.update_idletasks()
-        placed, unplaced = plan_loading(L, W, H, self.pallets)
+        placed, unplaced = plan_loading(L, W, H, self.pallets, budget=1.5)
         self.config(cursor="")
-        ResultWindow(self, CONTAINERS[self.ckey][0], (L, W, H), placed, unplaced,
-                     len(self.pallets))
+        ResultWindow(self, CONTAINERS[self.ckey][0], (L, W, H), list(self.pallets), placed, unplaced)
 
 
 def main():
