@@ -1502,13 +1502,13 @@ class ResultWindow(tk.Toplevel):
     def floor_loads(self):
         return [b for b in self.placed if b["n"] not in self.stack]
 
-    def children(self, n):
+    def tops_on(self, n):
         return [t for t, st in self.stack.items() if st["base"] == n]
 
     def descendants(self, n):
         out, todo = set(), [n]
         while todo:
-            for t in self.children(todo.pop()):
+            for t in self.tops_on(todo.pop()):
                 if t not in out:
                     out.add(t)
                     todo.append(t)
@@ -1523,7 +1523,7 @@ class ResultWindow(tk.Toplevel):
         return self.get_placed(n)
 
     def subtree_height(self, n):
-        return self.by_n[n].h + max((self.subtree_height(c) for c in self.children(n)), default=0)
+        return self.by_n[n].h + max((self.subtree_height(c) for c in self.tops_on(n)), default=0)
 
     def inside(self, b):
         L, W, _ = self.dims
