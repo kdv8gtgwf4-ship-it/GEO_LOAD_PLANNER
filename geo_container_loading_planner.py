@@ -258,6 +258,9 @@ def attach_stacks(floor, stack, by_n):
     stack = {top number: dict(base, u, v, du, dv)} - position of the top load in the frame of the
     load below it (u along its length, v along its width), so a stack moves and turns as one.
     Returns (all placed loads, numbers of top loads whose base load is not placed)."""
+    for b in floor:  # start from the plain number again (a load may have lost the one it carried)
+        if b["n"] in by_n:
+            b["label"] = by_n[b["n"]].label
     placed = {b["n"]: b for b in floor}
     pending = dict(stack)
     progress = True
@@ -280,7 +283,8 @@ def attach_stacks(floor, stack, by_n):
     has_top = {b["base"] for b in placed.values() if b.get("base")}
     for b in placed.values():
         if b["n"] in has_top or b.get("base"):
-            b["label"] = f"{b['n']}/{b['level']}"
+            word = "bottom" if b["level"] == 1 else ("middle" if b["n"] in has_top else "top")
+            b["label"] = f"{b['n']}/{word}"
     return list(placed.values()), list(pending)
 
 
@@ -795,26 +799,34 @@ class PlanCanvas(tk.Canvas):
                                            weight="bold" if bold else "normal")
         return self._fonts[key]
 
-    def _fit_texts(self, texts, x1, y1, x2, y2, tag, min_lines=1, min_px=7):
-        """Writes the lines into the rectangle with the biggest font that fits; False if none."""
-        rw, rh = x2 - x1, y2 - y1
+    @staticmethod
+    def _text_options(b):
+        """Text layouts of a load, richest first: 3 lines / 2 lines / number only."""
+        label = f"#{b['label']}"
+        dims = f"{fmt(b['dx'])}×{fmt(b['dy'])}×{fmt(b['h'])}"
+        return [(label, b["kind"], dims), (f"{label}  {b['kind']}", dims), (label,)]
+
+    def _pick(self, opts, rw, rh, min_px=7):
+        """Biggest font (and the richest layout) that fits into rw x rh:
+        (texts, fonts, line heights) or None."""
         if rw <= 4 or rh <= 4:
-            return False
-        for nlines in (3, 2, 1):
-            if nlines < min_lines or nlines > len(texts):
-                continue
-            for px in range(18, min_px - 1, -1):
-                sizes = [px, max(7, int(px * 0.72)), max(7, int(px * 0.64))][:nlines]
+            return None
+        for px in range(18, min_px - 1, -1):
+            for texts in opts:
+                sizes = [px, max(7, int(px * 0.72)), max(7, int(px * 0.64))][:len(texts)]
                 fonts = [self._font(sizes[0], True)] + [self._font(z) for z in sizes[1:]]
-                wmax = max(f.measure(t) for f, t in zip(fonts, texts))
                 lhs = [f.metrics("linespace") for f in fonts]
-                if wmax <= rw * 0.94 and sum(lhs) <= rh * 0.94:
-                    yy = (y1 + y2) / 2 - sum(lhs) / 2
-                    for f, t, lh in zip(fonts, texts, lhs):
-                        self.create_text((x1 + x2) / 2, yy + lh / 2, text=t, font=f, tags=(tag,))
-                        yy += lh
-                    return True
-        return False
+                if (max(f.measure(t) for f, t in zip(fonts, texts)) <= rw * 0.94
+                        and sum(lhs) <= rh * 0.94):
+                    return texts, fonts, lhs
+        return None
+
+    def _write(self, picked, x1, y1, x2, y2, tag, from_top=False):
+        texts, fonts, lhs = picked
+        yy = y1 + 3 if from_top else (y1 + y2) / 2 - sum(lhs) / 2
+        for f, t, lh in zip(fonts, texts, lhs):
+            self.create_text((x1 + x2) / 2, yy + lh / 2, text=t, font=f, tags=(tag,))
+            yy += lh
 
     def redraw(self):
         self.delete("all")
@@ -846,66 +858,51 @@ class PlanCanvas(tk.Canvas):
         tops_of = {}
         for b in self.placed:
             if b.get("base"):
-                tops_of.setdefault(b["base"], []).append(b)
+                tops_of.setdefault(b["base"], []). append(b)
         order = self._drawing_order()
-        # 1. the rectangles (loads standing on others get a shadow, a lighter fill and a navy frame)
+        # rectangles to draw: a load carrying others writes its text in a band at its top edge;
+        # the loads standing on it are drawn below that band (so nothing is covered)
+        V, picked, band = {}, {}, {}
         for b in order:
+            n = b["n"]
             x1, y1, x2, y2 = self.rect_of(b)
-            tag = f"L{b['n']}"
-            color = PALETTE[(b["n"] - 1) % len(PALETTE)]
-            sel = (b["n"] == self.selected)
+            if b.get("base") in V:
+                ny1 = max(y1, V[b["base"]][1] + band.get(b["base"], 0))
+                if y2 - ny1 >= 14:
+                    y1 = ny1
+            V[n] = (x1, y1, x2, y2)
+            opts = self._text_options(b)
+            if n in tops_of:
+                pk = self._pick(opts, x2 - x1, (y2 - y1) * 0.42, min_px=8)
+                picked[n] = pk
+                band[n] = (sum(pk[2]) + 8) if pk else 0
+            else:
+                picked[n] = self._pick(opts, x2 - x1, y2 - y1)
+        # 1. shapes: floor loads coloured, a load standing on another one = white window
+        for b in order:
+            n = b["n"]
+            x1, y1, x2, y2 = V[n]
+            tag = f"L{n}"
+            sel = (n == self.selected)
             if b.get("base"):
                 self.create_rectangle(x1 + 3, y1 + 3, x2 + 3, y2 + 3, fill="#7a8599", outline="",
                                       tags=(tag,))
-                fill, outline, width = mix(color, "#ffffff", 0.35), NAVY, 3
+                fill, outline, width = "white", NAVY, 3
             else:
-                fill, outline, width = color, "#222", 1.5
+                fill, outline, width = PALETTE[(n - 1) % len(PALETTE)], "#222", 1.5
             if sel:
                 outline, width = "#1e90ff", 4
-            self._rects[b["n"]] = self.create_rectangle(x1, y1, x2, y2, fill=fill, outline=outline,
-                                                        width=width, tags=(tag,))
-        # 2. loads that carry others: text into the free strips around the upper loads, or a plate
-        plates = []  # (base number, x1, y1, x2, y2, lines)
+            self._rects[n] = self.create_rectangle(x1, y1, x2, y2, fill=fill, outline=outline,
+                                                   width=width, tags=(tag,))
+        # 2. text
         for b in order:
-            tops = tops_of.get(b["n"])
-            if not tops:
-                continue
-            x1, y1, x2, y2 = self.rect_of(b)
-            tag = f"L{b['n']}"
-            texts = (f"#{b['label']}", b["kind"], f"{fmt(b['dx'])}×{fmt(b['dy'])}×{fmt(b['h'])}")
-            two = (f"#{b['label']}  {b['kind']}", texts[2])
-            rects = [self.rect_of(t) for t in tops]
-            bx1, by1 = min(r[0] for r in rects), min(r[1] for r in rects)
-            bx2, by2 = max(r[2] for r in rects), max(r[3] for r in rects)
-            strips = [(x1, y1, x2, by1), (x1, by2, x2, y2), (x1, y1, bx1, y2), (bx2, y1, x2, y2)]
-            strips.sort(key=lambda r: -((r[2] - r[0]) * (r[3] - r[1])))
-            if not any(self._fit_texts(texts, *r, tag, min_lines=3, min_px=9) or
-                       self._fit_texts(two, *r, tag, min_lines=2, min_px=9) for r in strips):
-                f1, f2 = self._font(10, True), self._font(9)
-                w = min(max(f1.measure(two[0]), f2.measure(two[1])) + 10, x2 - x1 - 4)
-                plates.append((b["n"], x1 + 2, y1 + 2, x1 + 2 + w, y1 + 34, two))
-        for n, px1, py1, px2, py2, lines in plates:
-            tag = f"L{n}"
-            self.create_rectangle(px1, py1, px2, py2, fill="white", outline="#222", tags=(tag,))
-            self.create_text(px1 + 5, py1 + 10, text=lines[0], font=self._font(10, True), anchor="w",
-                             tags=(tag,))
-            self.create_text(px1 + 5, py1 + 24, text=lines[1], font=self._font(9), anchor="w",
-                             tags=(tag,))
-        # 3. text of all the other loads (kept clear of the plates)
-        for b in order:
-            if b["n"] in tops_of:
-                x1, y1, x2, y2 = self.rect_of(b)
-            else:
-                x1, y1, x2, y2 = self.rect_of(b)
-                for n, px1, py1, px2, py2, _ in plates:
-                    if n != b["n"] and px1 < x2 and px2 > x1 and py1 < y2 and py2 > y1:
-                        y1 = max(y1, py2 + 2)
-                texts = (f"#{b['label']}", b["kind"], f"{fmt(b['dx'])}×{fmt(b['dy'])}×{fmt(b['h'])}")
-                self._fit_texts(texts, x1, y1, x2, y2, f"L{b['n']}")
-            if b["n"] in self.pinned:  # small navy dot = this load is pinned
-                x1, y1, x2, y2 = self.rect_of(b)
+            n = b["n"]
+            x1, y1, x2, y2 = V[n]
+            if picked.get(n):
+                self._write(picked[n], x1, y1, x2, y2, f"L{n}", from_top=(n in tops_of))
+            if n in self.pinned:  # small navy dot = this load is pinned
                 self.create_oval(x2 - 14, y1 + 4, x2 - 4, y1 + 14, fill=NAVY, outline="white",
-                                 width=1.5, tags=(f"L{b['n']}",))
+                                 width=1.5, tags=(f"L{n}",))
 
     # ---- mouse -------------------------------------------------------------
     def _hit(self, x, y):
@@ -996,6 +993,21 @@ def _draw_block(d, cx, cy, specs, fs, color="#111111"):
     for (text, k, bold), hh in zip(specs, hs):
         _text_center(d, cx, yy + hh / 2, text, _pil_font(max(6, int(fs * k)), bold), color)
         yy += hh
+
+
+def _pick_layout(d, rw, rh, opts, fs_u):
+    """(specs, font size): the richest text layout that fits, at the uniform size fs_u (or a
+    little smaller - never below 60 % of it); fewer lines only if even that does not fit."""
+    lo = max(10, int(fs_u * 0.6) // 2 * 2)
+    for specs in opts:
+        fs = _fit_block(d, rw, rh, specs, min_fs=lo, max_fs=fs_u)
+        if fs:
+            return specs, fs
+    for specs in opts:
+        fs = _fit_block(d, rw, rh, specs, min_fs=10, max_fs=lo)
+        if fs:
+            return specs, fs
+    return opts[-1], 10
 
 
 def _spec_options(label, kind, dims):
@@ -1111,65 +1123,52 @@ def render_plan_image(cname, dims, placed, unplaced, total, door_left=False):
         if b.get("base"):
             tops_of.setdefault(b["base"], []).append(b)
     order = sorted(placed, key=lambda b: b.get("level", 1))
-    # 1. the rectangles (a load standing on another one: shadow, lighter fill, navy frame)
-    for b in order:
+    opts_of = {b["n"]: _spec_options(f"#{b['label']}", b["kind"],
+                                     f"{fmt(b['dx'])}×{fmt(b['dy'])}×{fmt(b['h'])}") for b in placed}
+    # one text size for all loads (the biggest at which the smallest load still fits), so that
+    # the picture looks the same on every load - and like the picture on the screen
+    est = []
+    for b in placed:
         x1, y1, x2, y2 = rect(b)
-        color = PALETTE[(b["n"] - 1) % len(PALETTE)]
+        est.append(_fit_block(d, x2 - x1, (y2 - y1) * (0.42 if b["n"] in tops_of else 1.0),
+                              opts_of[b["n"]][0], min_fs=10, max_fs=P(36)) or 10)
+    fs_u = max(P(18), min(P(36), min(est))) if est else P(30)
+    # a load carrying others writes its text in a band at its top edge; the loads standing on it
+    # are drawn below that band
+    V, layout, band = {}, {}, {}
+    for b in order:
+        n = b["n"]
+        x1, y1, x2, y2 = rect(b)
+        if b.get("base") in V:
+            ny1 = max(y1, V[b["base"]][1] + band.get(b["base"], 0))
+            if y2 - ny1 >= P(40):
+                y1 = ny1
+        V[n] = (x1, y1, x2, y2)
+        if n in tops_of:
+            specs, fs = _pick_layout(d, x2 - x1, (y2 - y1) * 0.42, opts_of[n], fs_u)
+            band[n] = sum(int(fs * k * 1.3) for _, k, _ in specs) + P(10)
+        else:
+            specs, fs = _pick_layout(d, x2 - x1, y2 - y1, opts_of[n], fs_u)
+        layout[n] = (specs, fs)
+    # 1. shapes: floor loads coloured, a load standing on another one = white window
+    for b in order:
+        x1, y1, x2, y2 = V[b["n"]]
         if b.get("base"):
             d.rectangle([x1 + P(6), y1 + P(6), x2 + P(6), y2 + P(6)], fill="#7a8599")
-            d.rectangle([x1, y1, x2, y2], fill=mix(color, "#ffffff", 0.35), outline=NAVY, width=P(5))
+            d.rectangle([x1, y1, x2, y2], fill="white", outline=NAVY, width=P(5))
         else:
-            d.rectangle([x1, y1, x2, y2], fill=color, outline="#222222", width=P(3))
-    # 2. loads that carry others: text into the free strips around the upper loads, else a plate
-    plates = []  # (base number, x1, y1, x2, y2, specs, font size)
+            d.rectangle([x1, y1, x2, y2], fill=PALETTE[(b["n"] - 1) % len(PALETTE)],
+                        outline="#222222", width=P(3))
+    # 2. text
     for b in order:
-        tops = tops_of.get(b["n"])
-        if not tops:
-            continue
-        x1, y1, x2, y2 = rect(b)
-        opts = _spec_options(f"#{b['label']}", b["kind"], f"{fmt(b['dx'])}×{fmt(b['dy'])}×{fmt(b['h'])}")
-        rects = [rect(t) for t in tops]
-        bx1, by1 = min(r[0] for r in rects), min(r[1] for r in rects)
-        bx2, by2 = max(r[2] for r in rects), max(r[3] for r in rects)
-        strips = [(x1, y1, x2, by1), (x1, by2, x2, y2), (x1, y1, bx1, y2), (bx2, y1, x2, y2)]
-        strips.sort(key=lambda r: -((r[2] - r[0]) * (r[3] - r[1])))
-        done = False
-        for sx1, sy1, sx2, sy2 in strips:
-            for specs in opts[:2]:
-                fs = _fit_block(d, sx2 - sx1, sy2 - sy1, specs, min_fs=P(15))
-                if fs:
-                    _draw_block(d, (sx1 + sx2) / 2, (sy1 + sy2) / 2, specs, fs)
-                    done = True
-                    break
-            if done:
-                break
-        if not done:
-            specs = opts[1]
-            for fs in range(P(26), P(11), -2):
-                w = max(d.textlength(t, font=_pil_font(int(fs * k), bl)) for t, k, bl in specs) + P(18)
-                if w <= (x2 - x1) - P(8):
-                    break
-            hh = sum(int(fs * k * 1.3) for _, k, _ in specs) + P(12)
-            plates.append((b["n"], x1 + P(4), y1 + P(4), x1 + P(4) + w, y1 + P(4) + hh, specs, fs))
-    for n, px1, py1, px2, py2, specs, fs in plates:
-        d.rectangle([px1, py1, px2, py2], fill="white", outline="#222222", width=P(2))
-        _draw_block(d, (px1 + px2) / 2, (py1 + py2) / 2, specs, fs)
-    # 3. text of all the other loads (kept clear of the plates)
-    for b in order:
-        if b["n"] in tops_of:
-            continue
-        x1, y1, x2, y2 = rect(b)
-        for n, px1, py1, px2, py2, _, _ in plates:
-            if n != b["n"] and px1 < x2 and px2 > x1 and py1 < y2 and py2 > y1:
-                y1 = max(y1, py2 + P(4))
-        opts = _spec_options(f"#{b['label']}", b["kind"], f"{fmt(b['dx'])}×{fmt(b['dy'])}×{fmt(b['h'])}")
-        for specs in opts:
-            fs = _fit_block(d, x2 - x1, y2 - y1, specs)
-            if fs:
-                _draw_block(d, (x1 + x2) / 2, (y1 + y2) / 2, specs, fs)
-                break
+        n = b["n"]
+        x1, y1, x2, y2 = V[n]
+        specs, fs = layout[n]
+        if n in tops_of:
+            hh = sum(int(fs * k * 1.3) for _, k, _ in specs)
+            _draw_block(d, (x1 + x2) / 2, y1 + P(5) + hh / 2, specs, fs)
         else:
-            _draw_block(d, (x1 + x2) / 2, (y1 + y2) / 2, opts[2], 10)
+            _draw_block(d, (x1 + x2) / 2, (y1 + y2) / 2, specs, fs)
     return img
 
 
@@ -1235,28 +1234,37 @@ def render_3d_image(cname, dims, placed, unplaced, total, door_left=False):
         for j in after[i]:
             indeg[j] -= 1
 
+    # one text size for all faces
+    carries = {b["base"] for b in placed if b.get("base")}
+    est = []
+    for b, x0, x1, ya, yb, z0, z1 in boxes:
+        o3 = _spec_options(f"#{b['label']}", b["kind"], f"{fmt(b['dx'])}×{fmt(b['dy'])}×{fmt(b['h'])}")[0]
+        est.append(_fit_block(d, (x1 - x0) * s, (z1 - z0) * s, o3, min_fs=10, max_fs=P(34)) or 10)
+        if b["n"] not in carries:
+            est.append(_fit_block(d, (x1 - x0) * s * 0.85, (yb - ya) * ky * s * 0.8, o3,
+                                  min_fs=10, max_fs=P(34)) or 10)
+    fs3 = max(P(16), min(P(34), min(est))) if est else P(26)
+
     for i in order:
         b, x0, x1, ya, yb, z0, z1 = boxes[i]
         color = PALETTE[(b["n"] - 1) % len(PALETTE)]
+        top_fill = mix(color, "#ffffff", 0.35)
         poly([(x1, ya, z0), (x1, yb, z0), (x1, yb, z1), (x1, ya, z1)], mix(color, "#000000", 0.28))
-        poly([(x0, ya, z1), (x1, ya, z1), (x1, yb, z1), (x0, yb, z1)], mix(color, "#ffffff", 0.35))
+        poly([(x0, ya, z1), (x1, ya, z1), (x1, yb, z1), (x0, yb, z1)], top_fill)
         poly([(x0, ya, z0), (x1, ya, z0), (x1, ya, z1), (x0, ya, z1)], color)
-        # text on the front face: number, type and size
+        opts = _spec_options(f"#{b['label']}", b["kind"],
+                             f"{fmt(b['dx'])}×{fmt(b['dy'])}×{fmt(b['h'])}")
+        # front face: number, type and size
         fx1, fy1 = pr(x0, ya, z1)
         fx2, fy2 = pr(x1, ya, z0)
-        label = f"#{b['label']}"
-        dims_t = f"{fmt(b['dx'])}×{fmt(b['dy'])}×{fmt(b['h'])}"
-        for specs in _spec_options(label, b["kind"], dims_t):
-            fs = _fit_block(d, fx2 - fx1, fy2 - fy1, specs, min_fs=P(8), max_fs=70)
-            if fs:
-                _draw_block(d, (fx1 + fx2) / 2, (fy1 + fy2) / 2, specs, fs)
-                break
-        # number on the top face as well (the front face may be hidden by other loads)
-        tx, ty = pr((x0 + x1) / 2, (ya + yb) / 2, z1)
-        fs = _fit_block(d, (x1 - x0) * s * 0.8, (yb - ya) * ky * s * 0.8, [(label, 1.0, True)],
-                        min_fs=P(8), max_fs=60)
-        if fs:
-            _draw_block(d, tx, ty, [(label, 1.0, True)], fs)
+        specs, fs = _pick_layout(d, fx2 - fx1, fy2 - fy1, opts, fs3)
+        _draw_block(d, (fx1 + fx2) / 2, (fy1 + fy2) / 2, specs, fs)
+        # top face: the same text (the front face of loads in the back rows is hidden);
+        # not for loads that have another load standing on them
+        if b["n"] not in carries:
+            tx, ty = pr((x0 + x1) / 2, (ya + yb) / 2, z1)
+            specs, fs = _pick_layout(d, (x1 - x0) * s * 0.85, (yb - ya) * ky * s * 0.8, opts, fs3)
+            _draw_block(d, tx, ty, specs, fs)
 
     # door frame at the near end
     pp = [pr(L, 0, 0), pr(L, W, 0), pr(L, W, H), pr(L, 0, H)]
