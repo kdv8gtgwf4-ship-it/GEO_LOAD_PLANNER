@@ -596,7 +596,7 @@ class ImportDialog(tk.Toplevel):
         super().__init__(master)
         self.title("Import from Excel")
         self.configure(bg="white")
-        self.geometry("980x640")
+        fit_window(self, 980, 640, 760, 480)
         self.transient(master)
         self.result = None
         self.items = []
@@ -721,6 +721,23 @@ class PlanCanvas(tk.Canvas):
         self.bind("<ButtonPress-1>", self._press)
         self.bind("<B1-Motion>", self._motion)
         self.bind("<ButtonRelease-1>", self._release)
+        self.on_context = None
+        for ev in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):
+            self.bind(ev, self._context)
+
+    def _context(self, e):
+        """Right click on a load in the picture: select it and open its menu."""
+        if self.s is None:
+            return
+        b = self._hit(e.x, e.y)
+        if b is None:
+            return
+        self.selected = b["n"]
+        if self.on_select:
+            self.on_select(b["n"])
+        self.redraw()
+        if self.on_context:
+            self.on_context(b["n"], e.x_root, e.y_root)
 
     def set_data(self, placed, pinned=None, selected=None, door_left=None):
         self.placed = placed
@@ -1255,6 +1272,49 @@ def render_3d_image(cname, dims, placed, unplaced, total, door_left=False):
 # ----------------------------------------------------------------------------
 #  Result window: diagram + editing of the arrangement
 # ----------------------------------------------------------------------------
+def fit_window(win, width, height, min_w=900, min_h=600):
+    """Opens the window centred and never bigger than the screen (taskbar and title included)."""
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    w, h = min(width, sw - 40), min(height, sh - 110)
+    win.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 2 - 20)}")
+    win.minsize(min(min_w, w), min(min_h, h))
+
+
+class ScrollFrame(ttk.Frame):
+    """A frame whose content can be scrolled up and down (scroll bar and mouse wheel)."""
+
+    def __init__(self, master, width=380):
+        super().__init__(master)
+        self.canvas = tk.Canvas(self, bg="white", highlightthickness=0, width=width)
+        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vsb.set)
+        self.vsb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.inner = ttk.Frame(self.canvas)
+        self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>",
+                        lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(self._win, width=e.width))
+        self.bind_all("<MouseWheel>", self._on_wheel, add="+")
+
+    def _on_wheel(self, e):
+        try:
+            if not self.winfo_exists():
+                return
+            if isinstance(e.widget, (ttk.Treeview, tk.Listbox)):
+                return  # lists scroll themselves
+            w = self.winfo_containing(e.x_root, e.y_root)
+            while w is not None and w is not self:
+                w = w.master
+            if w is None:
+                return  # the pointer is not over this panel
+            if self.inner.winfo_reqheight() <= self.canvas.winfo_height():
+                return  # everything is visible, nothing to scroll
+            self.canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
+        except (tk.TclError, KeyError):
+            pass
+
+
 class ResultWindow(tk.Toplevel):
     COLS = [("order", "Loading order", 110), ("n", "#", 60), ("kind", "Type", 90),
             ("size", "Size L×W×H, mm", 150), ("x", "X, mm", 80), ("y", "Y, mm", 80),
@@ -1275,8 +1335,11 @@ class ResultWindow(tk.Toplevel):
         self.gap_var, self.wall_var = tk.StringVar(value=fmt(GAP)), tk.StringVar(value=fmt(WALL))
         self.title(f"Loading Plan - {cname}")
         self.configure(bg="white")
-        self.geometry("1440x920")
-        self.minsize(1150, 720)
+        fit_window(self, 1440, 920, 1000, 600)
+        try:
+            self.state("zoomed")  # use the whole screen on Windows
+        except tk.TclError:
+            pass
         build_header(self, "Loading Plan")
 
         self.summary = ttk.Label(self, text="", wraplength=1380, padding=(10, 8),
@@ -1285,20 +1348,25 @@ class ResultWindow(tk.Toplevel):
         self.warn = tk.Label(self, text="", fg="#b00020", bg="white", wraplength=1380,
                              justify="left", font=("Segoe UI", 10, "bold"), padx=10)
         self.warn.pack(fill="x", anchor="w")
+        self.bind("<Configure>", self._on_resize)
 
-        bot = ttk.Frame(self, padding=(10, 0, 10, 10))
+        bot = ttk.Frame(self, padding=(10, 0, 10, 8))
         bot.pack(side="bottom", fill="x")
+        btnrow = ttk.Frame(bot)
+        btnrow.pack(side="bottom", fill="x")
         ttk.Label(bot, text="Drag a load in the picture - the others are re-arranged around it.   "
-                            "Right-click a load in the list to put it on another load.",
-                  foreground=MUTED).pack(side="left")
-        ttk.Button(bot, text="Close", command=self.destroy).pack(side="right")
-        ttk.Button(bot, text="Save as CSV…", command=self.save_csv).pack(side="right", padx=6)
-        ttk.Button(bot, text="Save as PDF", style="Accent.TButton",
+                            "Select a load and press 'Put on' (or right-click it in the list "
+                            "or in the picture) to stand it on another load.",
+                  foreground=MUTED).pack(side="bottom", anchor="w", pady=(0, 4))
+        ttk.Button(btnrow, text="Close", command=self.destroy).pack(side="right")
+        ttk.Button(btnrow, text="Save as CSV…", command=self.save_csv).pack(side="right", padx=6)
+        ttk.Button(btnrow, text="Save as PDF", style="Accent.TButton",
                    command=lambda: self.export("pdf")).pack(side="right", padx=6)
-        ttk.Button(bot, text="Save as PNG", style="Accent.TButton",
+        ttk.Button(btnrow, text="Save as PNG", style="Accent.TButton",
                    command=lambda: self.export("png")).pack(side="right")
-        ttk.Button(bot, text="Open layout…", command=self.load_layout).pack(side="right", padx=(6, 18))
-        ttk.Button(bot, text="Save layout…", command=self.save_layout).pack(side="right")
+        ttk.Button(btnrow, text="Open layout…", command=self.load_layout).pack(side="right",
+                                                                              padx=(6, 18))
+        ttk.Button(btnrow, text="Save layout…", command=self.save_layout).pack(side="right")
 
         pw = ttk.PanedWindow(self, orient="horizontal")
         pw.pack(fill="both", expand=True, padx=8, pady=8)
@@ -1308,6 +1376,7 @@ class ResultWindow(tk.Toplevel):
         pw.add(right, weight=1)
         self.canvas = PlanCanvas(left, L, W, self.placed, False, self.on_canvas_select, self.on_drop)
         self.canvas.configure(width=900, height=520)
+        self.canvas.on_context = self.canvas_menu
         self.canvas.pack(fill="both", expand=True)
         self.build_panel(right)
         if layout:
@@ -1320,8 +1389,17 @@ class ResultWindow(tk.Toplevel):
         else:
             self.refresh_all()
 
-    # ---------- right-hand panel ----------
-    def build_panel(self, p):
+    def _on_resize(self, e):
+        if e.widget is self:
+            w = max(300, e.width - 40)
+            self.summary.config(wraplength=w)
+            self.warn.config(wraplength=w)
+
+    # ---------- right-hand panel (scrollable) ----------
+    def build_panel(self, parent):
+        sfr = ScrollFrame(parent, width=390)
+        sfr.pack(fill="both", expand=True)
+        p = sfr.inner
         box = ttk.LabelFrame(p, text="Doors and clearance", padding=8)
         box.pack(fill="x")
         r0 = ttk.Frame(box)
@@ -1340,9 +1418,9 @@ class ResultWindow(tk.Toplevel):
                                                                        padx=6)
 
         lf = ttk.LabelFrame(p, text="Loads  (click a row or a load; right-click for more)", padding=8)
-        lf.pack(fill="both", expand=True, pady=8)
+        lf.pack(fill="x", pady=8)
         cols = ("n", "kind", "size", "x", "y", "order", "pin")
-        self.tree = ttk.Treeview(lf, columns=cols, show="headings", selectmode="browse", height=10)
+        self.tree = ttk.Treeview(lf, columns=cols, show="headings", selectmode="browse", height=9)
         for c, t, w in (("n", "#", 44), ("kind", "Type", 56), ("size", "Size, mm", 96),
                         ("x", "X", 50), ("y", "Y", 50), ("order", "Seq.", 40), ("pin", "Pin", 34)):
             self.tree.heading(c, text=t)
@@ -1366,7 +1444,12 @@ class ResultWindow(tk.Toplevel):
         r1.pack(fill="x", pady=(6, 0))
         ttk.Button(r1, text="Rotate 90°", command=self.rotate_selected).pack(side="left")
         ttk.Button(r1, text="Pin / Unpin", command=self.toggle_pin).pack(side="left", padx=6)
-        ttk.Button(r1, text="Take off", command=self.take_off_selected).pack(side="left")
+        r1b = ttk.Frame(sf)
+        r1b.pack(fill="x", pady=(6, 0))
+        self.put_btn = ttk.Button(r1b, text="Put on  ▸", style="Accent.TButton",
+                                  command=self.put_on_button)
+        self.put_btn.pack(side="left")
+        ttk.Button(r1b, text="Take off", command=self.take_off_selected).pack(side="left", padx=6)
         ttk.Label(sf, text="Slide as far as possible:", foreground=MUTED).pack(anchor="w", pady=(8, 2))
         g = ttk.Frame(sf)
         g.pack(fill="x")
@@ -1901,15 +1984,10 @@ class ResultWindow(tk.Toplevel):
             return
         self.take_off(b["n"])
 
-    def tree_menu(self, event):
-        row = self.tree.identify_row(event.y)
-        if not row:
-            return
-        self.tree.selection_set(row)
-        n = int(row)
+    def put_on_candidates_menu(self, parent, n):
+        """A menu listing all the loads that load n could be put on. Returns (menu, has entries)."""
         p = self.by_n[n]
-        m = tk.Menu(self, tearoff=0)
-        sub = tk.Menu(m, tearoff=0)
+        sub = tk.Menu(parent, tearoff=0)
         banned = self.descendants(n) | {n}
         cands = [b for b in sorted(self.placed, key=lambda b: b["n"]) if b["n"] not in banned]
         for b in cands:
@@ -1921,7 +1999,40 @@ class ResultWindow(tk.Toplevel):
                 if res.get("over"):
                     label += f"   (stack {fmt(res['over'])} mm - above the limit)"
                 sub.add_command(label=label, command=lambda t=b["n"]: self.put_on(n, t))
-        if cands:
+        return sub, bool(cands)
+
+    def put_on_button(self):
+        n = self.sel
+        if n is None or n not in self.by_n:
+            messagebox.showinfo(APP_TITLE, "Select the load that should stand on top first "
+                                           "(click it in the list or in the picture).", parent=self)
+            return
+        sub, has = self.put_on_candidates_menu(self, n)
+        if not has:
+            messagebox.showinfo(APP_TITLE, "There is no other placed load to put it on.", parent=self)
+            return
+        x = self.put_btn.winfo_rootx()
+        y = self.put_btn.winfo_rooty() + self.put_btn.winfo_height()
+        try:
+            sub.tk_popup(x, y)
+        finally:
+            sub.grab_release()
+
+    def tree_menu(self, event):
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        self.tree.selection_set(row)
+        self.show_load_menu(int(row), event.x_root, event.y_root)
+
+    def canvas_menu(self, n, x_root, y_root):
+        self.show_load_menu(n, x_root, y_root)
+
+    def show_load_menu(self, n, x_root, y_root):
+        """Right-click menu of a load (in the list or in the picture)."""
+        m = tk.Menu(self, tearoff=0)
+        sub, has = self.put_on_candidates_menu(m, n)
+        if has:
             m.add_cascade(label="Put on  ▸", menu=sub)
         else:
             m.add_command(label="Put on  (no other placed loads)", state="disabled")
@@ -1931,7 +2042,7 @@ class ResultWindow(tk.Toplevel):
         m.add_command(label="Rotate 90°", command=self.rotate_selected)
         m.add_command(label="Pin / Unpin", command=self.toggle_pin)
         try:
-            m.tk_popup(event.x_root, event.y_root)
+            m.tk_popup(x_root, y_root)
         finally:
             m.grab_release()
 
@@ -2308,8 +2419,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1020x800")
-        self.minsize(920, 720)
+        fit_window(self, 1020, 800, 900, 600)
         self.configure(bg="white")
         self.setup_style()
         self.pallets = []
@@ -2319,6 +2429,22 @@ class App(tk.Tk):
         self.container = ttk.Frame(self)
         self.container.pack(fill="both", expand=True)
         self.show_select()
+
+    def report_callback_exception(self, exc, val, tb):
+        """Tk swallows errors in button / menu handlers; in the .exe nobody would ever see them."""
+        import traceback
+        text = "".join(traceback.format_exception(exc, val, tb))
+        log = os.path.join(os.path.expanduser("~"), "GeoContainerPlanner_error.log")
+        try:
+            with open(log, "a", encoding="utf-8") as fh:
+                fh.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n" + text + "\n")
+        except OSError:
+            pass
+        try:
+            messagebox.showerror(APP_TITLE, f"Something went wrong:\n\n{val}\n\n"
+                                            f"Details were saved to:\n{log}")
+        except Exception:
+            pass
 
     def setup_style(self):
         st = ttk.Style(self)
