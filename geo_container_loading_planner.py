@@ -1133,6 +1133,7 @@ def render_plan_image(cname, dims, placed, unplaced, total, door_left=False):
         est.append(_fit_block(d, x2 - x1, (y2 - y1) * (0.42 if b["n"] in tops_of else 1.0),
                               opts_of[b["n"]][0], min_fs=10, max_fs=P(36)) or 10)
     fs_u = max(P(18), min(P(36), min(est))) if est else P(30)
+    fs_floor = min(P(54), int(round(fs_u * 1.5)))  # loads standing alone on the floor: +50 %
     # a load carrying others writes its text in a band at its top edge; the loads standing on it
     # are drawn below that band
     V, layout, band = {}, {}, {}
@@ -1148,7 +1149,8 @@ def render_plan_image(cname, dims, placed, unplaced, total, door_left=False):
             specs, fs = _pick_layout(d, x2 - x1, (y2 - y1) * 0.42, opts_of[n], fs_u)
             band[n] = sum(int(fs * k * 1.3) for _, k, _ in specs) + P(10)
         else:
-            specs, fs = _pick_layout(d, x2 - x1, y2 - y1, opts_of[n], fs_u)
+            standalone = not b.get("base")
+            specs, fs = _pick_layout(d, x2 - x1, y2 - y1, opts_of[n], fs_floor if standalone else fs_u)
         layout[n] = (specs, fs)
     # 1. shapes: floor loads coloured, a load standing on another one = white window
     for b in order:
@@ -1176,6 +1178,7 @@ def render_3d_image(cname, dims, placed, unplaced, total, door_left=False):
     """Page 2: the same arrangement in 3D (oblique view from the doors side), so that loads
     standing on other loads can be seen."""
     import math
+    from PIL import Image, ImageDraw
     L, W, H = dims
     IW = 4000
     u = IW / 2400.0
@@ -1234,37 +1237,92 @@ def render_3d_image(cname, dims, placed, unplaced, total, door_left=False):
         for j in after[i]:
             indeg[j] -= 1
 
-    # one text size for all faces
     carries = {b["base"] for b in placed if b.get("base")}
-    est = []
-    for b, x0, x1, ya, yb, z0, z1 in boxes:
-        o3 = _spec_options(f"#{b['label']}", b["kind"], f"{fmt(b['dx'])}×{fmt(b['dy'])}×{fmt(b['h'])}")[0]
-        est.append(_fit_block(d, (x1 - x0) * s, (z1 - z0) * s, o3, min_fs=10, max_fs=P(34)) or 10)
-        if b["n"] not in carries:
-            est.append(_fit_block(d, (x1 - x0) * s * 0.85, (yb - ya) * ky * s * 0.8, o3,
-                                  min_fs=10, max_fs=P(34)) or 10)
-    fs3 = max(P(16), min(P(34), min(est))) if est else P(26)
 
+    def faces(box):
+        _, x0, x1, ya, yb, z0, z1 = box
+        return {"front": [pr(x0, ya, z0), pr(x1, ya, z0), pr(x1, ya, z1), pr(x0, ya, z1)],
+                "top": [pr(x0, ya, z1), pr(x1, ya, z1), pr(x1, yb, z1), pr(x0, yb, z1)],
+                "right": [pr(x1, ya, z0), pr(x1, yb, z0), pr(x1, yb, z1), pr(x1, ya, z1)]}
+
+    def coverage(face_pts, later, rect):
+        """Share of the rectangle in which this face is really seen (not covered by later boxes)."""
+        x1, y1, x2, y2 = (int(round(v)) for v in rect)
+        w, h = max(1, x2 - x1), max(1, y2 - y1)
+        m = Image.new("L", (w, h), 0)
+        dm = ImageDraw.Draw(m)
+        dm.polygon([(px - x1, py - y1) for px, py in face_pts], fill=255)
+        for poly_pts in later:
+            dm.polygon([(px - x1, py - y1) for px, py in poly_pts], fill=0)
+        return m.histogram()[255] / float(w * h)
+
+    # 1. the boxes themselves (painter's order)
     for i in order:
         b, x0, x1, ya, yb, z0, z1 = boxes[i]
         color = PALETTE[(b["n"] - 1) % len(PALETTE)]
-        top_fill = mix(color, "#ffffff", 0.35)
+        fc = faces(boxes[i])
         poly([(x1, ya, z0), (x1, yb, z0), (x1, yb, z1), (x1, ya, z1)], mix(color, "#000000", 0.28))
-        poly([(x0, ya, z1), (x1, ya, z1), (x1, yb, z1), (x0, yb, z1)], top_fill)
+        poly([(x0, ya, z1), (x1, ya, z1), (x1, yb, z1), (x0, yb, z1)], mix(color, "#ffffff", 0.35))
         poly([(x0, ya, z0), (x1, ya, z0), (x1, ya, z1), (x0, ya, z1)], color)
-        opts = _spec_options(f"#{b['label']}", b["kind"],
-                             f"{fmt(b['dx'])}×{fmt(b['dy'])}×{fmt(b['h'])}")
-        # front face: number, type and size
-        fx1, fy1 = pr(x0, ya, z1)
-        fx2, fy2 = pr(x1, ya, z0)
-        specs, fs = _pick_layout(d, fx2 - fx1, fy2 - fy1, opts, fs3)
-        _draw_block(d, (fx1 + fx2) / 2, (fy1 + fy2) / 2, specs, fs)
-        # top face: the same text (the front face of loads in the back rows is hidden);
-        # not for loads that have another load standing on them
+
+    # 2. every load gets ONE text, on the face where it is really visible: the top face
+    #    (not for a load that carries another one) or the front face; if a load is partly hidden
+    #    by loads in front of it, the text moves to the part that can be seen
+    pos_in_order = {i: k for k, i in enumerate(order)}
+    chosen = {}
+    for i in range(n):
+        box = boxes[i]
+        b, x0, x1, ya, yb, z0, z1 = box
+        later = []
+        for j in order[pos_in_order[i] + 1:]:
+            later += list(faces(boxes[j]).values())
+        fc = faces(box)
+        cands = []
         if b["n"] not in carries:
             tx, ty = pr((x0 + x1) / 2, (ya + yb) / 2, z1)
-            specs, fs = _pick_layout(d, (x1 - x0) * s * 0.85, (yb - ya) * ky * s * 0.8, opts, fs3)
-            _draw_block(d, tx, ty, specs, fs)
+            tw, th = (x1 - x0) * s * 0.85, (yb - ya) * ky * s * 0.8
+            cands.append(("top", (tx - tw / 2, ty - th / 2, tx + tw / 2, ty + th / 2)))
+        fx1, fy1 = pr(x0, ya, z1)
+        fx2, fy2 = pr(x1, ya, z0)
+        cands.append(("front", (fx1, fy1, fx2, fy2)))
+        # fall-backs: halves of the faces
+        for name, (a1, b1, a2, b2) in list(cands):
+            mx, my = (a1 + a2) / 2, (b1 + b2) / 2
+            cands += [(name, (a1, b1, mx, b2)), (name, (mx, b1, a2, b2)),
+                      (name, (a1, b1, a2, my)), (name, (a1, my, a2, b2))]
+        best = None
+        for k, (name, rect) in enumerate(cands):
+            cov = coverage(fc[name], later, rect)
+            if cov >= 0.9:          # first fully visible place wins (top face, front face, halves)
+                best = (name, rect, cov)
+                break
+            if best is None or cov > best[2]:
+                best = (name, rect, cov)
+        chosen[i] = best
+
+    est = []
+    for i, (name, rect, cov) in chosen.items():
+        if cov < 0.6:  # partly hidden loads must not make the text of all the others smaller
+            continue
+        b = boxes[i][0]
+        o3 = _spec_options(f"#{b['label']}", b["kind"], f"{fmt(b['dx'])}×{fmt(b['dy'])}×{fmt(b['h'])}")[0]
+        est.append(_fit_block(d, rect[2] - rect[0], rect[3] - rect[1], o3, min_fs=10,
+                              max_fs=P(36)) or 10)
+    fs3 = max(P(18), min(P(36), min(est))) if est else P(26)
+    for i, (name, rect, cov) in chosen.items():
+        b = boxes[i][0]
+        opts = _spec_options(f"#{b['label']}", b["kind"],
+                             f"{fmt(b['dx'])}×{fmt(b['dy'])}×{fmt(b['h'])}")
+        specs, fs = _pick_layout(d, rect[2] - rect[0], rect[3] - rect[1], opts, fs3)
+        cx, cy = (rect[0] + rect[2]) / 2, (rect[1] + rect[3]) / 2
+        if cov < 0.4:  # (almost) completely hidden: write it on a small white tag so it is not lost
+            hh = sum(int(fs * k * 1.3) for _, k, _ in specs) + P(8)
+            ww = max(d.textlength(t, font=_pil_font(max(6, int(fs * k)), bl)) for t, k, bl in specs) + P(12)
+            d.rectangle([cx - ww / 2, cy - hh / 2, cx + ww / 2, cy + hh / 2], fill="white",
+                        outline="#222222", width=P(2))
+        _draw_block(d, cx, cy, specs, fs)
+    render_3d_image.last_report = {boxes[i][0]["label"]: (name, round(cov, 2))
+                                   for i, (name, rect, cov) in chosen.items()}
 
     # door frame at the near end
     pp = [pr(L, 0, 0), pr(L, W, 0), pr(L, W, H), pr(L, 0, H)]
